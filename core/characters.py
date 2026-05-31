@@ -21,6 +21,27 @@ def overlay_png(frame, png, x, y, scale=1.0, alpha_multiplier=1.0):
 
     png = cv2.resize(png, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
+    # Normalize backgrounds to transparency:
+    # - If image has 3 channels, create an alpha channel by treating near-white/near-gray
+    #   uniform pixels as transparent (handles exported checkerboard backgrounds).
+    # - If image already has alpha, clear alpha where the RGB looks like a uniform
+    #   near-white/gray background.
+    if png.shape[2] == 3:
+        bgr = png
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        channel_std = np.std(bgr.astype(np.int16), axis=2)
+        # uniform and bright pixels -> treat as background
+        bg_mask = (channel_std < 8) & (gray >= 190)
+        alpha_chan = (~bg_mask).astype(np.uint8) * 255
+        png = np.dstack([bgr, alpha_chan])
+    elif png.shape[2] == 4:
+        bgr = png[:, :, :3]
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        channel_std = np.std(bgr.astype(np.int16), axis=2)
+        bg_mask = (channel_std < 8) & (gray >= 190)
+        # zero-out alpha for detected background pixels
+        png[:, :, 3][bg_mask] = 0
+
     x1 = int(x - new_w // 2)
     y1 = int(y - new_h // 2)
     x2 = x1 + new_w
@@ -67,9 +88,12 @@ def draw_hologram(frame, png, x, y, scale=1.0):
         alpha_multiplier=pulse
     )
 
-    # scanline hologram effect
+    # subtle scanline hologram effect: blend faint horizontal lines
+    overlay = frame.copy()
     for row in range(0, frame.shape[0], 8):
-        cv2.line(frame, (0, row), (frame.shape[1], row), (255, 255, 255), 1)
+        cv2.line(overlay, (0, row), (frame.shape[1], row), (255, 255, 255), 1)
+    # blend the overlay very lightly to avoid harsh white stripes
+    cv2.addWeighted(overlay, 0.06, frame, 0.94, 0, frame)
 
     return frame
 

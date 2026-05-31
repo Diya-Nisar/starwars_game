@@ -10,8 +10,10 @@ import random
 import pygame
 
 from core.hand_tracking import process_hands, draw_landmarks
+import core.hand_tracking as hand_tracking_mod
 from core.gestures import is_fist, is_open_hand, peace_sign
 from core.saber import toggle_saber, update_saber, draw_saber, change_color, current_color_name
+import core.saber as saber_mod
 from core.effects import add_shockwave, draw_shockwaves
 from core.particles import create_sparks, draw_particles
 
@@ -35,7 +37,7 @@ from core.boss import (
     boss_hits_player
 )
 
-from core.character import (
+from core.characters import (
     draw_anakin,
     draw_yoda_message,
     draw_vader_boss,
@@ -102,6 +104,7 @@ victory_flash = 0
 # ============================================
 
 prev_wrist = None
+smoothed_wrist = None
 swing_speed = 0
 
 trail_points = []
@@ -419,6 +422,15 @@ while True:
 
     results = process_hands(frame)
 
+    # Debug: show skin mask inset to help position your hand
+    try:
+        if hand_tracking_mod.last_mask is not None:
+            mask_small = cv2.resize(hand_tracking_mod.last_mask, (200, 112))
+            mask_col = cv2.cvtColor(mask_small, cv2.COLOR_GRAY2BGR)
+            frame[10:10+mask_col.shape[0], 1040:1040+mask_col.shape[1]] = mask_col
+    except Exception:
+        pass
+
     # ============================================
     # COMBO RESET
     # ============================================
@@ -457,6 +469,71 @@ while True:
     frame = draw_anakin(frame)
 
     # ============================================
+    # FALLBACK: if no landmarks, try centroid from skin mask
+    # (helps when synthetic landmarks fail; keeps saber visible)
+    if not results.multi_hand_landmarks:
+        try:
+            mask = hand_tracking_mod.last_mask
+            if mask is not None:
+                contours, _c = cv2.findContours(mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if contours:
+                    contour = max(contours, key=cv2.contourArea)
+                    area = cv2.contourArea(contour)
+                    if area > 1500:
+                        x, y, bw, bh = cv2.boundingRect(contour)
+                        cx = int(x + bw / 2)
+                        cy = int(y + bh / 2)
+
+                        # approximate wrist slightly below center
+                        wx, wy = cx, int(y + bh * 0.85)
+
+                        # point index tip roughly above center so saber points upward
+                        ix, iy = cx, max(0, int(cy - 60))
+
+                        # Smooth wrist position like when landmarks exist
+                        alpha = 0.6
+                        if smoothed_wrist is None:
+                            smoothed_wrist = (wx, wy)
+                        else:
+                            smoothed_wrist = (
+                                int(smoothed_wrist[0] * (1 - alpha) + wx * alpha),
+                                int(smoothed_wrist[1] * (1 - alpha) + wy * alpha)
+                            )
+
+                        sx, sy = smoothed_wrist
+
+                        # minimal swing when using fallback
+                        swing_speed = 0
+
+                        # Force-draw the saber for the fallback without changing
+                        # the persistent saber state: temporarily enable drawing
+                        prev_saber_state = saber_mod.saber_active
+                        try:
+                            saber_mod.saber_active = True
+                            end_x, end_y = draw_saber(
+                                frame,
+                                glow_layer,
+                                sx,
+                                sy,
+                                ix,
+                                iy,
+                                swing_speed
+                            )
+                        finally:
+                            saber_mod.saber_active = prev_saber_state
+
+                        trail_points.append((end_x, end_y))
+
+                        if len(trail_points) > 12:
+                            trail_points.pop(0)
+
+                        for i in range(1, len(trail_points)):
+                            alpha_t = i / len(trail_points)
+                            cv2.line(glow_layer, trail_points[i - 1], trail_points[i], (255, 255, 255), int(12 * alpha_t))
+        except Exception:
+            pass
+
+    # ============================================
     # HANDS
     # ============================================
 
@@ -465,42 +542,48 @@ while True:
         for hand_landmarks in results.multi_hand_landmarks:
 
             wrist = hand_landmarks.landmark[0]
-            index_base = hand_landmarks.landmark[5]
+            index_tip = hand_landmarks.landmark[8]
 
             wx, wy = int(wrist.x * w), int(wrist.y * h)
-            ix, iy = int(index_base.x * w), int(index_base.y * h)
+            ix, iy = int(index_tip.x * w), int(index_tip.y * h)
 
+            # Saber toggle — only act on state change to avoid repeated audio calls
             if is_fist(hand_landmarks):
-
-                toggle_saber(True)
-
-                play_ignition()
-
-                start_hum()
-
-            if is_open_hand(hand_landmarks):
-
-                toggle_saber(False)
-
-                stop_hum()
+                if not saber_mod.saber_active:
+                    toggle_saber(True)
+                    play_ignition()
+                    start_hum()
+            elif is_open_hand(hand_landmarks):
+                if saber_mod.saber_active:
+                    toggle_saber(False)
+                    stop_hum()
 
             if peace_sign(hand_landmarks):
-
                 change_color()
 
             update_saber()
 
-            if prev_wrist:
-
-                swing_speed = math.sqrt(
-                    (wx - prev_wrist[0]) ** 2 +
-                    (wy - prev_wrist[1]) ** 2
+            # Smooth wrist position for more stable swing detection
+            alpha = 0.6
+            if smoothed_wrist is None:
+                smoothed_wrist = (wx, wy)
+            else:
+                smoothed_wrist = (
+                    int(smoothed_wrist[0] * (1 - alpha) + wx * alpha),
+                    int(smoothed_wrist[1] * (1 - alpha) + wy * alpha)
                 )
 
-            prev_wrist = (wx, wy)
+            sx, sy = smoothed_wrist
+
+            if prev_wrist:
+                swing_speed = math.sqrt(
+                    (sx - prev_wrist[0]) ** 2 +
+                    (sy - prev_wrist[1]) ** 2
+                )
+
+            prev_wrist = (sx, sy)
 
             if swing_speed > 45:
-
                 play_swing()
 
             # ============================================
@@ -513,7 +596,7 @@ while True:
                 and force_energy > 0
             ):
 
-                add_shockwave(wx, wy)
+                add_shockwave(sx, sy)
 
                 play_force()
 
@@ -532,15 +615,15 @@ while True:
 
             if peace_sign(hand_landmarks) and force_energy > 40:
 
-                draw_lightning(frame, wx, wy)
+                draw_lightning(frame, sx, sy)
 
                 force_energy -= 0.5
 
                 if boss["active"]:
 
                     dist = math.sqrt(
-                        (wx - boss["x"]) ** 2 +
-                        (wy - boss["y"]) ** 2
+                        (sx - boss["x"]) ** 2 +
+                        (sy - boss["y"]) ** 2
                     )
 
                     if dist < 250:
@@ -552,8 +635,8 @@ while True:
                 for asteroid in blasters.asteroids:
 
                     dist = math.sqrt(
-                        (wx - asteroid["x"]) ** 2 +
-                        (wy - asteroid["y"]) ** 2
+                        (sx - asteroid["x"]) ** 2 +
+                        (sy - asteroid["y"]) ** 2
                     )
 
                     if dist > 250:
@@ -569,8 +652,8 @@ while True:
             end_x, end_y = draw_saber(
                 frame,
                 glow_layer,
-                wx,
-                wy,
+                sx,
+                sy,
                 ix,
                 iy,
                 swing_speed
@@ -605,8 +688,8 @@ while True:
             hit = blasters.check_asteroid_collision(
                 end_x,
                 end_y,
-                wx,
-                wy,
+                sx,
+                sy,
                 create_sparks
             )
 
@@ -838,13 +921,6 @@ while True:
             "Fear is the path to darkness."
         )
 
-    elif boss["active"]:
-
-        frame = draw_yoda_message(
-            frame,
-            "Face him, you must."
-        )
-
     # ============================================
     # WIN SCREEN
     # ============================================
@@ -988,6 +1064,16 @@ while True:
     cv2.imshow("STAR WARS FORCE TRAINER", frame)
 
     key = cv2.waitKey(1)
+
+    # Manual saber toggle for testing: press 's' to turn saber on/off
+    if key == ord('s'):
+        if not saber_mod.saber_active:
+            toggle_saber(True)
+            play_ignition()
+            start_hum()
+        else:
+            toggle_saber(False)
+            stop_hum()
 
     if key == 27:
         break
